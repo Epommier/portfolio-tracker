@@ -62,6 +62,7 @@ def capture_debank_porfolio(address, output_path):
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         page.goto(url)
+        page.set_viewport_size(viewport_size={ "width": 4880, "height": 2559 })
         time.sleep(10)
         
         # Wallet
