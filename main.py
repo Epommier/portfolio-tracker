@@ -17,6 +17,10 @@ from langchain_core.prompts import ChatPromptTemplate, HumanMessagePromptTemplat
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 
+from azure.ai.vision.imageanalysis import ImageAnalysisClient
+from azure.ai.vision.imageanalysis.models import VisualFeatures
+from azure.core.credentials import AzureKeyCredential
+
 set_verbose(True)
 
 class Evaluation(BaseModel):
@@ -50,8 +54,11 @@ vision_llm = AzureAIChatCompletionsModel(
     endpoint=os.environ["INFERENCE_API_ENDPOINT"],
     api_version=os.environ["INFERENCE_API_VERSION"],
     credential=os.environ["INFERENCE_API_KEY"],
-    model_name="Phi-3.5-vision-instruct",
-    temperature=0.0
+    #model_name="Phi-3.5-vision-instruct",
+    #model_name="Phi-4-multimodal-instruct",
+    model_name="Azure AI Vision",
+    temperature=0.0,
+    top_p=1
 )
 
 json_llm = llm.bind(response_format={"type": "json_object"})
@@ -61,71 +68,110 @@ def capture_debank_porfolio(address, output_path):
         url = f"https://debank.com/profile/{address}"
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
+
+        page.route("**/*.{png,jpg,jpeg,svg}", lambda route: route.abort())
+
         page.goto(url)
         page.set_viewport_size(viewport_size={ "width": 4880, "height": 2559 })
         time.sleep(10)
         
+        timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+
         # Wallet
         wallet = page.locator("div[class*='TokenWallet_table__']")
-        wallet.screenshot(path=f"{output_path}/debank_wallet_{time.time()}.png")
+        wallet.screenshot(animations="disabled", type="jpeg", quality=100, path=f"{output_path}/debank_wallet_{timestamp}.jpeg")
 
         # Protocols
-        protocols = page.locator(f"div[class^='Project_project__']").all()
+        protocols = page.locator("div[class^='Project_project__']").all()
         for protocol in protocols:
-            protocol.screenshot(path=f"{output_path}/debank_protocol_{time.time()}.png")
+            name = protocol.locator("span[class^='ProjectTitle_protocolLink__']").first
+            protocol_name = name.text_content()
+            protocol.screenshot(animations="disabled", type="jpeg", quality=100, path=f"{output_path}/debank_protocol_{protocol_name}_{timestamp}.jpeg")
 
         browser.close()
 
 def encode_image(image_path):
     with open(image_path, "rb") as image_file:
-        data_string = base64.b64encode(image_file.read()).decode('utf-8')
-        padding_len = len(data_string) % 4
-        data_string += padding_len * '='
-        return data_string
+        return base64.b64encode(image_file.read()).decode('utf-8')
+
+def analyze_image(image_path):
+    with open(image_path, "rb") as img:
+        image_data = img.read()
+
+        client = ImageAnalysisClient(
+            endpoint=os.environ["VISION_API_ENDPOINT"],
+            credential=AzureKeyCredential(os.environ["INFERENCE_API_KEY"])
+        )
+
+        result = client.analyze(
+            image_data,
+            visual_features=[VisualFeatures.READ]
+        )
+
+        if result.read is not None:
+            words = result.read.as_dict()["blocks"][0]["lines"]
+            lines = [words[n:n+4] for n in range(0, len(words), 4)]
+
+            for line in lines:
+                full_line = ""
+                for word in line:
+                    full_line += word["text"] + " "
+                print(full_line)
+    
+        return result;
 
 def extract_portfolio_data():
     print(f":runner:[italic green]Extracting portfolio data...[/italic green]")
     #capture_debank_porfolio("0x95c14c058aaffda687780eb60ef8658ef1166578", f"screens/")
     print(f":runner:[italic green]Done[/italic green]")
-
     print(f"Analyzing wallet data...")
-    wallet_image = encode_image(f"screens/debank_wallet.png")
+
+    ocr_data = analyze_image(f"screens/debank_wallet.jpeg")
+    print(ocr_data)
+
+    wallet_image = encode_image(f"screens/debank_wallet.jpeg")
     system_prompt =  """
         # Goal
-        Your task is to extract crypto wallet data from the image.
-        You should list all the tokens visible on the image, and return them in a list.
-        Wrapped tokens and their native representation should appear under their native token name(ie WETH == ETH, WBTC == BTC).
-        For each token you should return the name, the amount and the USD value.
+        Your task is to extract text data from the image.
+        You should list all the assets visible on the image, and return them in a list.       
+        For each asset you should return the name, the amount and the USD value you see on the image.
+        Note that the amount and dollar values are in US format, meaning the [,] character is the thousands separator (ie 29,700 is 29 700).
+        Be aware that there is also some numbers in scientific format.
 
         # Rules
-        - If no tokens are visible, return an empty list.
-        - You should **ONLY** return values extracted from the image, never make up ones.
-        - You should **NOT** return any values that are not extracted from the image.
+        - If no assets are visible, return an empty list.
+        - **ONLY** return numbers and texts you found on the image
+        - Numbers should be in decimal format for example "11,456.28" should returned as "11456.28" and "27,000" as "27000"
 
         # Response format
+        See the example below for your expected response format:
+
         ```json
         {{
             "tokens": [
                 {{
-                    "ticker": "BTC",
-                    "amount": 0.001,
-                    "usd_value": 100000
+                    "ticker": "[token_1_name]",
+                    "amount": [token_1_amount],
+                    "usd_value": [token_1_usd_value]
                 }},
                 {{
-                    "ticker": "ETH",
-                    "amount": 1,
-                    "usd_value": 2034.45
+                    "ticker": "[token_2_name]",
+                    "amount": [token_2_amount],
+                    "usd_value": [token_2_usd_value]
                 }}
             ]
         }}
-        ```"""
+        ```
+        """
 
     prompt = ChatPromptTemplate.from_messages(
     [
-        SystemMessage(content=system_prompt),
-        HumanMessagePromptTemplate.from_template(content=[
-            #{"type": "text", "text": "Extract the wallet composition from the image."},
-            {"type": "image_url", "image_url": {"url": "data:image/png;charset=utf-8;base64,{image_data}"}}
+        SystemMessage(content=[
+            {"type": "text", "text": system_prompt},
+        ]),
+        HumanMessagePromptTemplate.from_template(template=[
+            ##{"type": "text", "text": "Extract the wallet composition from the image."},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,{image_data}"}}
         ]),
     ])
 
